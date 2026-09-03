@@ -3,24 +3,19 @@ import random
 import warnings
 import numpy as np
 import pandas as pd
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 from tkinter import Tk, filedialog
-
 from sklearn.preprocessing import LabelEncoder, MinMaxScaler
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import f1_score, precision_score
 from sklearn.neighbors import kneighbors_graph
-
 from torch_geometric.data import Data
 from torch_geometric.nn import GATConv
 from torch_geometric.utils import from_scipy_sparse_matrix
 
 warnings.filterwarnings("ignore")
-
 
 # ============================================================
 # 1. CONFIGURATION
@@ -75,12 +70,9 @@ def select_csv_file():
         title="Select 5G Telemetry CSV",
         filetypes=[("CSV files", "*.csv")]
     )
-
     root.destroy()
-
     if not path:
         raise FileNotFoundError("No telemetry CSV selected.")
-
     return path
 
 
@@ -113,16 +105,13 @@ def load_data():
         raise ValueError(
             f"Target column '{TARGET_COL}' not found."
         )
-
     # --------------------------------------------------------
     # Failure labels
     # --------------------------------------------------------
     label_encoder = LabelEncoder()
-
     y = label_encoder.fit_transform(
         df[TARGET_COL].values
     )
-
     # --------------------------------------------------------
     # Node types tau(v)
     # --------------------------------------------------------
@@ -138,7 +127,6 @@ def load_data():
             ["NF"] * len(df),
             dtype=object
         )
-
     node_type_encoder = LabelEncoder()
 
     node_type = node_type_encoder.fit_transform(
@@ -160,31 +148,25 @@ def load_data():
     feature_df = feature_df.select_dtypes(
         include=[np.number]
     )
-
     if feature_df.shape[1] == 0:
         raise ValueError(
             "No numeric telemetry features found."
         )
-
     X = MinMaxScaler().fit_transform(
         feature_df.values
     )
-
     x = torch.tensor(
         X,
         dtype=torch.float32
     )
-
     y = torch.tensor(
         y,
         dtype=torch.long
     )
-
     node_type = torch.tensor(
         node_type,
         dtype=torch.long
     )
-
     print("\nDATASET")
     print("-" * 65)
     print(f"Nodes        : {x.size(0)}")
@@ -194,7 +176,6 @@ def load_data():
     print(f"Device       : {DEVICE}")
     print(f"Random seeds : {SEEDS}")
     print("-" * 65)
-
     return (
         x,
         y,
@@ -202,78 +183,54 @@ def load_data():
         label_encoder,
         node_type_encoder
     )
-
-
 # ============================================================
 # 4. GRAPH / RELATION CONSTRUCTION
 # ============================================================
 
 def build_relation_graph(x):
-    """
-    Fallback relation construction for the one-CSV pipeline.
-
-    Relation channels:
-      0 = strong telemetry similarity
-      1 = moderate telemetry similarity
-      2 = weak telemetry similarity
-
-    Replace this function with real typed 5G functional/protocol
-    edges when such relations are available.
-    """
     adj = kneighbors_graph(
         x.cpu().numpy(),
         n_neighbors=K_NEIGHBORS,
         mode="distance",
         include_self=False
     )
-
     edge_index, edge_weight = (
         from_scipy_sparse_matrix(adj)
     )
-
     edge_index = edge_index.long()
-
     distances = (
         edge_weight.float()
         .cpu()
         .numpy()
     )
-
     q1 = np.quantile(
         distances,
         1.0 / 3.0
     )
-
     q2 = np.quantile(
         distances,
         2.0 / 3.0
     )
-
     edge_type = np.zeros(
         len(distances),
         dtype=np.int64
     )
-
     edge_type[
         (distances > q1)
         & (distances <= q2)
     ] = 1
-
     edge_type[
         distances > q2
     ] = 2
-
     edge_type = torch.tensor(
         edge_type,
         dtype=torch.long
     )
-
     relation_names = [
         "strong_similarity",
         "moderate_similarity",
         "weak_similarity"
     ]
-
     print("\nGRAPH")
     print("-" * 65)
     print(f"Edges             : {edge_index.size(1)}")
@@ -286,19 +243,11 @@ def build_relation_graph(x):
         edge_type,
         relation_names
     )
-
-
-# ============================================================
-# 5. TRAIN / VALIDATION / TEST SPLITS
-# ============================================================
-
 def create_masks(y, seed):
     indices = np.arange(
         len(y)
     )
-
     labels = y.cpu().numpy()
-
     try:
         train_idx, temp_idx = train_test_split(
             indices,
@@ -307,7 +256,6 @@ def create_masks(y, seed):
             random_state=seed,
             shuffle=True
         )
-
         val_idx, test_idx = train_test_split(
             temp_idx,
             test_size=0.50,
@@ -315,7 +263,6 @@ def create_masks(y, seed):
             random_state=seed,
             shuffle=True
         )
-
     except ValueError:
         train_idx, temp_idx = train_test_split(
             indices,
@@ -323,51 +270,37 @@ def create_masks(y, seed):
             random_state=seed,
             shuffle=True
         )
-
         val_idx, test_idx = train_test_split(
             temp_idx,
             test_size=0.50,
             random_state=seed,
             shuffle=True
         )
-
     n = len(y)
-
     train_mask = torch.zeros(
         n,
         dtype=torch.bool
     )
-
     val_mask = torch.zeros(
         n,
         dtype=torch.bool
     )
-
     test_mask = torch.zeros(
         n,
         dtype=torch.bool
     )
-
     train_mask[train_idx] = True
     val_mask[val_idx] = True
     test_mask[test_idx] = True
-
     return (
         train_mask,
         val_mask,
         test_mask
     )
-
-
-# ============================================================
-# 6. TYPE-SPECIFIC TRANSFORMATION
-# ============================================================
-
 class TypeSpecificLinear(nn.Module):
     """
     Implements W_{tau(v)} or P_{tau(v)}^(l).
     """
-
     def __init__(
         self,
         in_dim,
@@ -390,45 +323,28 @@ class TypeSpecificLinear(nn.Module):
         node_type
     ):
         out_dim = self.layers[0].out_features
-
         out = torch.zeros(
             x.size(0),
             out_dim,
             dtype=x.dtype,
             device=x.device
         )
-
         for t, layer in enumerate(
             self.layers
         ):
             mask = (
                 node_type == t
             )
-
             if mask.any():
                 out[mask] = layer(
                     x[mask]
                 )
-
         return out
-
-
 # ============================================================
 # 7. RELATION-AWARE PROPAGATION
 # ============================================================
-
 class RelationPropagation(nn.Module):
-    """
-    For each relation r:
-      - selects N_r(v)
-      - GATConv computes W_r and alpha_{uv|r}
-      - produces z_{v,r}
-    Then:
-      - semantic attention computes beta_{v,r}
-      - relation representations are fused
-    """
-
-    def __init__(
+     def __init__(
         self,
         hidden_dim,
         num_relations,
@@ -436,10 +352,8 @@ class RelationPropagation(nn.Module):
         semantic_fusion=True
     ):
         super().__init__()
-
         self.num_relations = num_relations
         self.semantic_fusion = semantic_fusion
-
         # Relation-specific W_r and neighbor attention a_r
         self.rel_convs = nn.ModuleList([
             GATConv(
@@ -452,7 +366,6 @@ class RelationPropagation(nn.Module):
             )
             for _ in range(num_relations)
         ])
-
         # q^T tanh(W_s z_{v,r})
         self.semantic_score = nn.Sequential(
             nn.Linear(
@@ -481,23 +394,19 @@ class RelationPropagation(nn.Module):
             relation_mask = (
                 edge_type == r
             )
-
             edge_r = edge_index[
                 :,
                 relation_mask
             ]
-
             if edge_r.size(1) == 0:
                 z_r = torch.zeros_like(
                     h
                 )
-
                 available = torch.zeros(
                     h.size(0),
                     dtype=torch.bool,
                     device=h.device
                 )
-
             else:
                 # Equivalent to relation-specific attention aggregation
                 z_r = F.elu(
@@ -506,53 +415,43 @@ class RelationPropagation(nn.Module):
                         edge_r
                     )
                 )
-
                 available = torch.zeros(
                     h.size(0),
                     dtype=torch.bool,
                     device=h.device
                 )
-
                 available[
                     edge_r[1].unique()
                 ] = True
-
             relation_embeddings.append(
                 z_r
             )
-
             relation_available.append(
                 available
             )
-
         # Z[v,r,:] = z_{v,r}
         Z = torch.stack(
             relation_embeddings,
             dim=1
         )
-
         # A[v,r] indicates whether r is incident on v
         A = torch.stack(
             relation_available,
             dim=1
         )
-
         if self.semantic_fusion:
             score = (
                 self.semantic_score(Z)
                 .squeeze(-1)
             )
-
             score = score.masked_fill(
                 ~A,
                 -1e9
             )
-
             beta = torch.softmax(
                 score,
                 dim=1
             )
-
             valid = A.any(
                 dim=1,
                 keepdim=True
@@ -563,45 +462,35 @@ class RelationPropagation(nn.Module):
                 beta,
                 torch.zeros_like(beta)
             )
-
             h_rel = torch.sum(
                 beta.unsqueeze(-1) * Z,
                 dim=1
             )
-
         else:
             weights = (
                 A.float()
                 .unsqueeze(-1)
             )
-
             denominator = (
                 weights.sum(dim=1)
                 .clamp(min=1.0)
             )
-
             h_rel = (
                 (Z * weights)
                 .sum(dim=1)
                 / denominator
             )
-
         return h_rel
-
-
 # ============================================================
 # 8. SHARED CLASSIFIER
 # ============================================================
-
 class NodeClassifier(nn.Module):
-
     def __init__(
         self,
         hidden_dim,
         out_dim
     ):
         super().__init__()
-
         self.net = nn.Sequential(
             nn.Linear(
                 hidden_dim,
@@ -616,18 +505,14 @@ class NodeClassifier(nn.Module):
                 out_dim
             )
         )
-
     def forward(
         self,
         h
     ):
         return self.net(h)
-
-
 # ============================================================
 # 9. BASELINES
 # ============================================================
-
 class MTLGNN(nn.Module):
 
     def __init__(
@@ -638,28 +523,23 @@ class MTLGNN(nn.Module):
         num_relations
     ):
         super().__init__()
-
         self.encoder = nn.Linear(
             in_dim,
             hidden_dim
         )
-
         self.propagation = RelationPropagation(
             hidden_dim,
             num_relations,
             semantic_fusion=False
         )
-
         self.classifier = NodeClassifier(
             hidden_dim,
             out_dim
         )
-
         self.auxiliary = nn.Linear(
             hidden_dim,
             1
         )
-
     def forward(
         self,
         data
@@ -669,21 +549,16 @@ class MTLGNN(nn.Module):
                 data.x
             )
         )
-
         h = self.propagation(
             h,
             data.edge_index,
             data.edge_type
         )
-
         return (
             self.classifier(h),
             self.auxiliary(h)
         )
-
-
 class HeteroGNN(nn.Module):
-
     def __init__(
         self,
         in_dim,
@@ -697,18 +572,15 @@ class HeteroGNN(nn.Module):
             in_dim,
             hidden_dim
         )
-
         self.propagation = RelationPropagation(
             hidden_dim,
             num_relations,
             semantic_fusion=False
         )
-
         self.classifier = NodeClassifier(
             hidden_dim,
             out_dim
         )
-
     def forward(
         self,
         data
@@ -718,18 +590,13 @@ class HeteroGNN(nn.Module):
                 data.x
             )
         )
-
         h = self.propagation(
             h,
             data.edge_index,
             data.edge_type
         )
-
         return self.classifier(h)
-
-
 class HPN(nn.Module):
-
     def __init__(
         self,
         in_dim,
@@ -738,19 +605,16 @@ class HPN(nn.Module):
         num_relations
     ):
         super().__init__()
-
         self.encoder = nn.Linear(
             in_dim,
             hidden_dim
         )
-
         self.propagation = RelationPropagation(
             hidden_dim,
             num_relations,
             heads=1,
             semantic_fusion=True
         )
-
         self.gate = nn.Sequential(
             nn.Linear(
                 hidden_dim * 2,
@@ -758,12 +622,10 @@ class HPN(nn.Module):
             ),
             nn.Sigmoid()
         )
-
         self.classifier = NodeClassifier(
             hidden_dim,
             out_dim
         )
-
     def forward(
         self,
         data
@@ -773,13 +635,11 @@ class HPN(nn.Module):
                 data.x
             )
         )
-
         hp = self.propagation(
             h0,
             data.edge_index,
             data.edge_type
         )
-
         gate = self.gate(
             torch.cat(
                 [h0, hp],
@@ -796,7 +656,6 @@ class HPN(nn.Module):
 
 
 class RLPHGNN(nn.Module):
-
     def __init__(
         self,
         in_dim,
@@ -810,7 +669,6 @@ class RLPHGNN(nn.Module):
             in_dim,
             hidden_dim
         )
-
         self.propagation = RelationPropagation(
             hidden_dim,
             num_relations,
