@@ -1,0 +1,355 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+import numpy as np
+import pandas as pd
+import random
+import warnings
+from scipy import stats
+from sklearn.preprocessing import LabelEncoder, MinMaxScaler
+from sklearn.metrics import f1_score, precision_score
+from sklearn.neighbors import kneighbors_graph
+from torch_geometric.nn import MessagePassing
+import torch_geometric.utils
+from torch_geometric.utils import from_scipy_sparse_matrix
+from scipy.sparse import coo_matrix
+from tkinter import Tk, filedialog
+
+warnings.filterwarnings('ignore')
+
+# --- Hyperparameters ---
+HIDDEN_DIM = 256
+LR = 0.001
+EPOCHS = 150
+REPEATS = 2  # To calculate Mean ± Std
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+SEEDS = [42 + i * 10 for i in range(REPEATS)]
+
+TARGET_COL = "y_true(fc)"
+SOURCE_COL = "source_name"
+TIME_COL = "time"
+
+
+# ==============================================================================
+# 1. RELATION-AWARE GAT LAYER
+# ==============================================================================
+
+class RelationAwareGATConv(MessagePassing):
+    def __init__(self, in_dim, out_dim, dropout=0.3):
+        super().__init__(aggr='add', node_dim=0)
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.dropout = dropout
+
+        self.lin = nn.Linear(in_dim, out_dim, bias=False)
+        self.att = nn.Parameter(torch.empty(1, 2 * out_dim))
+        self.leaky_relu = nn.LeakyReLU(0.2)
+        nn.init.xavier_uniform_(self.att)
+
+    def forward(self, x, edge_index):
+        x_proj = self.lin(x)
+        return self.propagate(edge_index, x=x_proj, size=None)
+
+    def message(self, x_i, x_j, index, ptr, size_i):
+        concat_feats = torch.cat([x_j, x_i], dim=-1)
+        alpha = (concat_feats * self.att).sum(dim=-1, keepdim=True)
+        alpha = self.leaky_relu(alpha)
+        alpha = torch_geometric.utils.softmax(alpha, index, num_nodes=size_i)
+        alpha = F.dropout(alpha, p=self.dropout, training=self.training)
+        return alpha * x_j
+
+
+# ==============================================================================
+# 2. CONFIGURABLE ABLATION HGPNF MODEL
+# ==============================================================================
+
+class AblationHGPNF(nn.Module):
+    def __init__(
+        self,
+        in_dim,
+        hidden_dim,
+        out_dim,
+        num_node_types,
+        num_relations,
+        use_heterogeneity=True,
+        use_rel_prop=True,
+        use_fusion=True,
+        use_residual=True
+    ):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.num_relations = num_relations
+        self.num_node_types = num_node_types
+
+        self.use_heterogeneity = use_heterogeneity
+        self.use_rel_prop = use_rel_prop
+        self.use_fusion = use_fusion
+        self.use_residual = use_residual
+
+        # Type encoders
+        if use_heterogeneity:
+            self.type_encoders = nn.ModuleList([
+                nn.Linear(in_dim, hidden_dim) for _ in range(num_node_types)
+            ])
+            self.type_residuals = nn.ModuleList([
+                nn.Linear(in_dim, hidden_dim) for _ in range(num_node_types)
+            ])
+        else:
+            self.shared_encoder = nn.Linear(in_dim, hidden_dim)
+            self.shared_residual = nn.Linear(in_dim, hidden_dim)
+
+        # Relational Convolutions
+        if use_rel_prop:
+            self.rel_convs = nn.ModuleList([
+                RelationAwareGATConv(hidden_dim, hidden_dim) for _ in range(num_relations)
+            ])
+
+        # Fusion parameters
+        if use_fusion:
+            self.Ws_rel = nn.Linear(hidden_dim, hidden_dim)
+            self.q_att = nn.Parameter(torch.empty(1, hidden_dim))
+            nn.init.xavier_uniform_(self.q_att)
+
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(hidden_dim, out_dim)
+        )
+
+    def apply_layers(self, x, node_type, layers_list, shared_layer):
+        if self.use_heterogeneity:
+            output = torch.zeros(x.size(0), self.hidden_dim, device=x.device)
+            for t, layer in enumerate(layers_list):
+                mask = (node_type == t)
+                if mask.any():
+                    output[mask] = layer(x[mask])
+            return output
+        else:
+            return shared_layer(x)
+
+    def forward(self, data):
+        x = data.x
+        edge_index = data.edge_index
+        edge_type = data.edge_type
+        node_type = data.node_type
+
+        # 1. Initial Encoding
+        if self.use_heterogeneity:
+            h0 = self.apply_layers(x, node_type, self.type_encoders, None)
+        else:
+            h0 = self.shared_encoder(x)
+        h0 = F.relu(h0)
+        h0 = F.dropout(h0, p=0.3, training=self.training)
+
+        # 2. Relational Propagation
+        if self.use_rel_prop:
+            relation_embeddings = []
+            relation_available = []
+            for r in range(self.num_relations):
+                mask = (edge_type == r)
+                edge_r = edge_index[:, mask]
+                if edge_r.size(1) == 0:
+                    z_r = torch.zeros_like(h0)
+                    available = torch.zeros(h0.size(0), dtype=torch.bool, device=h0.device)
+                else:
+                    z_r = self.rel_convs[r](h0, edge_r)
+                    z_r = F.elu(z_r)
+                    available = torch.zeros(h0.size(0), dtype=torch.bool, device=h0.device)
+                    available[edge_r[1].unique()] = True
+                relation_embeddings.append(z_r)
+                relation_available.append(available)
+
+            Z = torch.stack(relation_embeddings, dim=1)
+            availability = torch.stack(relation_available, dim=1)
+
+            # 3. Fusion
+            if self.use_fusion:
+                transformed_Z = torch.tanh(self.Ws_rel(Z))
+                scores = (transformed_Z * self.q_att).sum(dim=-1)
+                scores = scores.masked_fill(~availability, -1e9)
+                beta = torch.softmax(scores, dim=1)
+                valid = availability.any(dim=1, keepdim=True)
+                beta = torch.where(valid, beta, torch.zeros_like(beta))
+                aggregated_z = torch.sum(beta.unsqueeze(-1) * Z, dim=1)
+            else:
+                aggregated_z = Z.mean(dim=1)
+        else:
+            aggregated_z = torch.zeros_like(h0)
+
+        # 4. Residual Update
+        if self.use_residual:
+            if self.use_heterogeneity:
+                h_res = self.apply_layers(x, node_type, self.type_residuals, None)
+            else:
+                h_res = self.shared_residual(x)
+            h = self.norm(h_res + aggregated_z)
+        else:
+            h = self.norm(aggregated_z)
+
+        h = F.dropout(h, p=0.3, training=self.training)
+        return self.classifier(h)
+
+
+# ==============================================================================
+# 3. HELPER FUNCTIONS FOR TELEMETRY LOADING
+# ==============================================================================
+
+def infer_nf_type(source_name):
+    s = str(source_name).lower()
+    if "amf" in s: return "AMF"
+    if "ausf" in s: return "AUSF"
+    if "udm" in s: return "UDM"
+    if "smf" in s: return "SMF"
+    if "upf" in s: return "UPF"
+    return "OTHER"
+
+
+# ==============================================================================
+# 4. EXPERIMENT EXECUTION ENGINE
+# ==============================================================================
+
+def run_experiment():
+    root = Tk()
+    root.withdraw()
+    path = filedialog.askopenfilename(title="Select 5G Telemetry CSV")
+    root.destroy()
+    if not path:
+        return
+
+    df = pd.read_csv(path)
+    if TARGET_COL not in df.columns or SOURCE_COL not in df.columns:
+        raise ValueError(f"Required columns '{TARGET_COL}' or '{SOURCE_COL}' missing from CSV.")
+
+    node_type_names = df[SOURCE_COL].apply(infer_nf_type).values
+    node_encoder = LabelEncoder()
+    node_type = torch.tensor(node_encoder.fit_transform(node_type_names), dtype=torch.long).to(DEVICE)
+
+    label_encoder = LabelEncoder()
+    y = torch.tensor(label_encoder.fit_transform(df[TARGET_COL].values), dtype=torch.long).to(DEVICE)
+
+    feature_df = df.drop(columns=[TARGET_COL, SOURCE_COL, TIME_COL], errors="ignore").select_dtypes(include=[np.number])
+    X_scaled = MinMaxScaler().fit_transform(feature_df.values)
+    x = torch.tensor(X_scaled, dtype=torch.float32).to(DEVICE)
+
+    num_nodes = x.size(0)
+    in_dim = x.size(1)
+    out_dim = len(torch.unique(y))
+    num_node_types = len(node_encoder.classes_)
+
+    # Construct multi-relation edges automatically from the single dataset
+    # Relation 0: k-NN feature similarity graph
+    adj_knn = kneighbors_graph(X_scaled, n_neighbors=min(10, num_nodes - 1), mode='connectivity', include_self=True)
+    edge_knn, _ = from_scipy_sparse_matrix(adj_knn)
+
+    # Relation 1: Sequential / temporal adjacency graph
+    if num_nodes > 1:
+        seq_src = np.arange(num_nodes - 1)
+        seq_dst = np.arange(1, num_nodes)
+        seq_edges = np.vstack([np.concatenate([seq_src, seq_dst]), np.concatenate([seq_dst, seq_src])])
+    else:
+        seq_edges = np.zeros((2, 0), dtype=np.int64)
+    edge_seq = torch.tensor(seq_edges, dtype=torch.long)
+
+    # Combine into unified multi-relation tensors
+    edge_index = torch.cat([edge_knn, edge_seq], dim=1).to(DEVICE)
+    edge_type = torch.cat([
+        torch.zeros(edge_knn.size(1), dtype=torch.long),
+        torch.ones(edge_seq.size(1), dtype=torch.long)
+    ]).to(DEVICE)
+    num_relations = 2
+
+    # Ablation variants matching Table tab:ablation
+    ablation_configs = {
+        "w/o Heterogeneity": {"use_heterogeneity": False, "use_rel_prop": True, "use_fusion": True, "use_residual": True},
+        "w/o Relational Propagation": {"use_heterogeneity": True, "use_rel_prop": False, "use_fusion": True, "use_residual": True},
+        "w/o Relation-Level Fusion": {"use_heterogeneity": True, "use_rel_prop": True, "use_fusion": False, "use_residual": True},
+        "w/o Residual Update": {"use_heterogeneity": True, "use_rel_prop": True, "use_fusion": True, "use_residual": False},
+        "HGPNF (Full)": {"use_heterogeneity": True, "use_rel_prop": True, "use_fusion": True, "use_residual": True}
+    }
+
+    print("\n" + "=" * 90)
+    print(f"Ablation Study Results (Mean ± Std over {REPEATS} seeds)")
+    print("=" * 90)
+    print(f"{'Variant':<32} | {'Micro-F1':<18} | {'Macro-F1':<18} | {'Macro-Precision'}")
+    print("-" * 90)
+
+    for name, config in ablation_configs.items():
+        micro_list, macro_list, prec_list = [], [], []
+
+        for seed in SEEDS:
+            random.seed(seed)
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed(seed)
+
+            # Simple random train/test split mask (80/20)
+            perm = torch.randperm(num_nodes)
+            train_size = int(0.8 * num_nodes)
+            train_mask = torch.zeros(num_nodes, dtype=torch.bool, device=DEVICE)
+            test_mask = torch.zeros(num_nodes, dtype=torch.bool, device=DEVICE)
+            train_mask[perm[:train_size]] = True
+            test_mask[perm[train_size:]] = True
+
+            class DataContainer:
+                pass
+            data = DataContainer()
+            data.x = x
+            data.y = y
+            data.edge_index = edge_index
+            data.edge_type = edge_type
+            data.node_type = node_type
+
+            model = AblationHGPNF(
+                in_dim=in_dim,
+                hidden_dim=HIDDEN_DIM,
+                out_dim=out_dim,
+                num_node_types=num_node_types,
+                num_relations=num_relations,
+                **config
+            ).to(DEVICE)
+
+            optimizer = optim.Adam(model.parameters(), lr=LR, weight_decay=1e-4)
+
+            model.train()
+            for _ in range(EPOCHS):
+                optimizer.zero_grad()
+                logits = model(data)
+                loss = F.cross_entropy(logits[train_mask], y[train_mask])
+                loss.backward()
+                optimizer.step()
+
+            model.eval()
+            with torch.no_grad():
+                logits = model(data)
+                preds = logits[test_mask].argmax(dim=1).cpu().numpy()
+                y_true = y[test_mask].cpu().numpy()
+
+            if len(y_true) > 0:
+                micro_list.append(f1_score(y_true, preds, average='micro', zero_division=0))
+                macro_list.append(f1_score(y_true, preds, average='macro', zero_division=0))
+                prec_list.append(precision_score(y_true, preds, average='macro', zero_division=0))
+            else:
+                micro_list.append(0.0)
+                macro_list.append(0.0)
+                prec_list.append(0.0)
+
+        mi_mean, mi_std = np.mean(micro_list), np.std(micro_list)
+        ma_mean, ma_std = np.mean(macro_list), np.std(macro_list)
+        pr_mean, pr_std = np.mean(prec_list), np.std(prec_list)
+
+        print(
+            f"{name:<32} | "
+            f"{mi_mean:.4f} ± {mi_std:.3f}   | "
+            f"{ma_mean:.4f} ± {ma_std:.3f}   | "
+            f"{pr_mean:.4f} ± {pr_std:.3f}"
+        )
+
+    print("=" * 90)
+
+
+if __name__ == "__main__":
+    run_experiment()
