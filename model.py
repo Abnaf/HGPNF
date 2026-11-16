@@ -1,6 +1,8 @@
 import copy
 import random
 import warnings
+import argparse
+from collections import Counter
 import numpy as np
 import pandas as pd
 import torch
@@ -9,17 +11,14 @@ import torch.nn.functional as F
 from tkinter import Tk, filedialog
 from sklearn.preprocessing import LabelEncoder, MinMaxScaler
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import f1_score, precision_score
+from sklearn.metrics import f1_score, precision_score, recall_score, confusion_matrix
 from sklearn.neighbors import kneighbors_graph
 from torch_geometric.data import Data
-from torch_geometric.nn import GATConv
+from torch_geometric.nn import GATConv, RGCNConv
 from torch_geometric.utils import from_scipy_sparse_matrix
 
 warnings.filterwarnings("ignore")
 
-# ============================================================
-# 1. CONFIGURATION
-# ============================================================
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -32,21 +31,12 @@ NUM_LAYERS = 2
 DROPOUT = 0.30
 LR = 1e-3
 WEIGHT_DECAY = 5e-4
-EPOCHS = 150
+EPOCHS = 350
 RUNS = 5
 K_NEIGHBORS = 10
 
 # Generate the five shared seeds once.
-SEEDS = np.random.default_rng().integers(
-    low=1,
-    high=100000,
-    size=RUNS
-).tolist()
-
-
-# ============================================================
-# 2. REPRODUCIBILITY
-# ============================================================
+SEEDS = [42, 52, 62, 72, 82]
 
 def set_seed(seed):
     random.seed(seed)
@@ -57,10 +47,6 @@ def set_seed(seed):
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
 
-
-# ============================================================
-# 3. DATA LOADING
-# ============================================================
 
 def select_csv_file():
     root = Tk()
@@ -97,24 +83,18 @@ def infer_nf_type(value):
     return "OTHER"
 
 
-def load_data():
-    path = select_csv_file()
+def load_data(path=None):
+    path = path or select_csv_file()
     df = pd.read_csv(path)
 
     if TARGET_COL not in df.columns:
         raise ValueError(
             f"Target column '{TARGET_COL}' not found."
         )
-    # --------------------------------------------------------
-    # Failure labels
-    # --------------------------------------------------------
     label_encoder = LabelEncoder()
     y = label_encoder.fit_transform(
         df[TARGET_COL].values
     )
-    # --------------------------------------------------------
-    # Node types tau(v)
-    # --------------------------------------------------------
     if SOURCE_COL in df.columns:
         nf_types = (
             df[SOURCE_COL]
@@ -132,10 +112,6 @@ def load_data():
     node_type = node_type_encoder.fit_transform(
         nf_types
     )
-
-    # --------------------------------------------------------
-    # Telemetry attributes X
-    # --------------------------------------------------------
     feature_df = df.drop(
         columns=[
             TARGET_COL,
@@ -176,16 +152,8 @@ def load_data():
     print(f"Device       : {DEVICE}")
     print(f"Random seeds : {SEEDS}")
     print("-" * 65)
-    return (
-        x,
-        y,
-        node_type,
-        label_encoder,
-        node_type_encoder
-    )
-# ============================================================
-# 4. GRAPH / RELATION CONSTRUCTION
-# ============================================================
+    timestamps = pd.to_datetime(df[TIME_COL], errors="coerce") if TIME_COL in df else None
+    return (x, y, node_type, label_encoder, node_type_encoder, timestamps)
 
 def build_relation_graph(x):
     adj = kneighbors_graph(
@@ -340,11 +308,8 @@ class TypeSpecificLinear(nn.Module):
                     x[mask]
                 )
         return out
-# ============================================================
-# 7. RELATION-AWARE PROPAGATION
-# ============================================================
 class RelationPropagation(nn.Module):
-     def __init__(
+    def __init__(
         self,
         hidden_dim,
         num_relations,
@@ -354,7 +319,7 @@ class RelationPropagation(nn.Module):
         super().__init__()
         self.num_relations = num_relations
         self.semantic_fusion = semantic_fusion
-        # Relation-specific W_r and neighbor attention a_r
+       
         self.rel_convs = nn.ModuleList([
             GATConv(
                 hidden_dim,
@@ -408,7 +373,7 @@ class RelationPropagation(nn.Module):
                     device=h.device
                 )
             else:
-                # Equivalent to relation-specific attention aggregation
+                
                 z_r = F.elu(
                     conv(
                         h,
@@ -481,9 +446,7 @@ class RelationPropagation(nn.Module):
                 / denominator
             )
         return h_rel
-# ============================================================
-# 8. SHARED CLASSIFIER
-# ============================================================
+
 class NodeClassifier(nn.Module):
     def __init__(
         self,
@@ -510,9 +473,7 @@ class NodeClassifier(nn.Module):
         h
     ):
         return self.net(h)
-# ============================================================
-# 9. BASELINES
-# ============================================================
+
 class MTLGNN(nn.Module):
 
     def __init__(
@@ -1132,9 +1093,26 @@ class KGBP(nn.Module):
         return self.classifier(h)
 
 
-# ============================================================
-# 10. HGPNF — EXACTLY ALIGNED TO THE PAPER ALGORITHM
-# ============================================================
+
+class RGCN(nn.Module):
+    """Schlichtkrull-style relation-specific graph convolution baseline."""
+    def __init__(self, in_dim, hidden_dim, out_dim, num_relations):
+        super().__init__()
+        self.encoder = nn.Linear(in_dim, hidden_dim)
+        self.conv1 = RGCNConv(hidden_dim, hidden_dim, num_relations)
+        self.conv2 = RGCNConv(hidden_dim, hidden_dim, num_relations)
+        self.classifier = NodeClassifier(hidden_dim, out_dim)
+
+    def forward(self, data):
+        h = F.relu(self.encoder(data.x))
+        h = F.dropout(h, p=DROPOUT, training=self.training)
+        h = F.relu(self.conv1(h, data.edge_index, data.edge_type))
+        h = F.dropout(h, p=DROPOUT, training=self.training)
+        h = F.relu(self.conv2(h, data.edge_index, data.edge_type))
+        return self.classifier(h)
+
+
+
 
 class HGPNF(nn.Module):
     """
@@ -1267,11 +1245,6 @@ class HGPNF(nn.Module):
 
         return logits
 
-
-# ============================================================
-# 11. MODEL REGISTRY / FACTORY
-# ============================================================
-
 BASELINE_CLASSES = {
     "MTL-GNN": MTLGNN,
     "Hetero-GNN": HeteroGNN,
@@ -1282,7 +1255,8 @@ BASELINE_CLASSES = {
     "HAN": HAN,
     "HGT": HGT,
     "MAGNN": MAGNN,
-    "KGBP": KGBP
+    "KGBP": KGBP,
+    "R-GCN": RGCN
 }
 
 MODEL_ORDER = [
@@ -1296,6 +1270,7 @@ MODEL_ORDER = [
     "HGT",
     "MAGNN",
     "KGBP",
+    "R-GCN",
     "HGPNF (Ours)"
 ]
 
@@ -1330,10 +1305,6 @@ def build_model(
     )
 
 
-# ============================================================
-# 12. OUTPUT HELPER
-# ============================================================
-
 def get_output(
     model,
     model_name,
@@ -1352,10 +1323,6 @@ def get_output(
         None
     )
 
-
-# ============================================================
-# 13. EVALUATION
-# ============================================================
 
 def evaluate(
     model,
@@ -1399,6 +1366,7 @@ def evaluate(
         y_true,
         y_pred,
         average="macro",
+        labels=np.arange(int(data.y.max().item()) + 1),
         zero_division=0
     )
 
@@ -1406,6 +1374,7 @@ def evaluate(
         y_true,
         y_pred,
         average="macro",
+        labels=np.arange(int(data.y.max().item()) + 1),
         zero_division=0
     )
 
@@ -1415,18 +1384,13 @@ def evaluate(
         macro_precision
     )
 
-
-# ============================================================
-# 14. TRAINING
-# ============================================================
-
 def train_model(
     model,
     model_name,
     data
 ):
-    # weight_decay provides the L2-style regularization term
-    # corresponding to lambda ||Theta||_2^2.
+    # Adam weight_decay is 5e-4; this is not necessarily the same
+    # coefficient as an explicitly written lambda * ||Theta||^2 objective.
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=LR,
@@ -1497,291 +1461,149 @@ def train_model(
         data.test_mask
     )
 
-
-# ============================================================
-# 15. LATEX OUTPUT
-# ============================================================
-
-def print_latex_rows(
-    results_df
-):
-    print("\nLATEX TABLE ROWS\n")
-
+def print_latex_rows(results_df):
+    """Columns match manuscript: Macro-F1, Micro-F1, Macro-Precision."""
+    print("\nLATEX TABLE ROWS (Macro-F1, Micro-F1, Macro-Precision)\n")
     for _, row in results_df.iterrows():
         name = row["Model"]
-
-        micro = (
-            f"{row['Micro-F1 Mean']:.4f}"
-            f"$\\pm${row['Micro-F1 Std']:.4f}"
-        )
-
-        macro = (
-            f"{row['Macro-F1 Mean']:.4f}"
-            f"$\\pm${row['Macro-F1 Std']:.4f}"
-        )
-
-        precision = (
-            f"{row['Macro-Precision Mean']:.4f}"
-            f"$\\pm${row['Macro-Precision Std']:.4f}"
-        )
-
-        if name == "HGPNF (Ours)":
-            print(
-                "\\textbf{HGPNF (Ours)} "
-                f"& \\textbf{{{micro}}} "
-                f"& \\textbf{{{macro}}} "
-                f"& \\textbf{{{precision}}} \\\\"
-            )
-        else:
-            print(
-                f"{name} "
-                f"& {micro} "
-                f"& {macro} "
-                f"& {precision} \\\\"
-            )
+        cells = []
+        for key in ("Macro-F1", "Micro-F1", "Macro-Precision"):
+            value = f"{row[key + ' Mean']:.4f} \\pm {row[key + ' Std']:.4f}"
+            cells.append(f"$\\mathbf{{{value}}}$" if name == "HGPNF (Ours)" else f"${value}$")
+        print(name + " & " + " & ".join(cells) + " " + "\\\\")
 
 
-# ============================================================
-# 16. MAIN BENCHMARK
-# ============================================================
+def prepare_features(raw_x, train_mask):
+    """Train-only median imputation and MinMax scaling; prevents fit leakage."""
+    x = raw_x.cpu().numpy().copy()
+    train = x[train_mask.cpu().numpy()]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        medians = np.nanmedian(train, axis=0)
+    medians = np.where(np.isfinite(medians), medians, 0.0)
+    x = np.where(np.isfinite(x), x, medians[None, :])
+    scaler = MinMaxScaler().fit(x[train_mask.cpu().numpy()])
+    return torch.tensor(scaler.transform(x), dtype=torch.float32)
 
-def run_benchmark():
-    (
-        x,
-        y,
-        node_type,
-        label_encoder,
-        node_type_encoder
-    ) = load_data()
 
-    (
-        edge_index,
-        edge_type,
-        relation_names
-    ) = build_relation_graph(
-        x
-    )
+def chronological_masks(timestamps, n):
+    """Chronological 60/20/20 split; no overlapping indices."""
+    if timestamps is None or timestamps.isna().any():
+        raise ValueError("Chronological splitting requires complete parseable time values.")
+    order = np.argsort(timestamps.to_numpy(), kind="stable")
+    a, b = int(.6*n), int(.8*n)
+    masks = []
+    for inds in (order[:a], order[a:b], order[b:]):
+        mask = torch.zeros(n, dtype=torch.bool)
+        mask[inds] = True
+        masks.append(mask)
+    return tuple(masks)
 
-    in_dim = x.size(1)
 
-    out_dim = len(
-        torch.unique(y)
-    )
+def print_class_distribution(y, encoder, masks):
+    labels = y.cpu().numpy()
+    print("\nPER-CLASS SAMPLE DISTRIBUTION (full/train/val/test)")
+    print("-"*100)
+    for c, name in enumerate(encoder.classes_):
+        counts = [int(np.sum(labels == c))]
+        counts += [int(np.sum(labels[m.cpu().numpy()] == c)) for m in masks]
+        print(f"{name:<48} {counts[0]:>5} {counts[1]:>5} {counts[2]:>5} {counts[3]:>5}")
 
-    num_node_types = len(
-        node_type_encoder.classes_
-    )
 
-    num_relations = len(
-        relation_names
-    )
+def print_hgpnf_diagnostics(model, data, encoder, run):
+    model.eval()
+    with torch.no_grad():
+        pred = model(data).argmax(dim=1)
+    yt = data.y[data.test_mask].cpu().numpy()
+    yp = pred[data.test_mask].cpu().numpy()
+    labels = np.arange(len(encoder.classes_))
+    p = precision_score(yt, yp, labels=labels, average=None, zero_division=0)
+    r = recall_score(yt, yp, labels=labels, average=None, zero_division=0)
+    f = f1_score(yt, yp, labels=labels, average=None, zero_division=0)
+    cm = confusion_matrix(yt, yp, labels=labels)
+    print(f"\nHGPNF TEST PER-CLASS METRICS — SEED {run}")
+    print(f"{'Class':<47} {'Support':>7} {'Precision':>10} {'Recall':>10} {'F1':>10}")
+    for i, name in enumerate(encoder.classes_):
+        print(f"{name:<47} {int((yt==i).sum()):>7} {p[i]:>10.4f} {r[i]:>10.4f} {f[i]:>10.4f}")
+    print("\nHGPNF TEST CONFUSION MATRIX (rows=true, columns=predicted)")
+    print("Label indices:", "; ".join(f"{i}={name}" for i, name in enumerate(encoder.classes_)))
+    print(cm)
+    return p, r, f, cm
 
-    all_results = []
+
+
+def run_benchmark(csv_path=None, split_mode="random", diagnostic_seed=42):
+    raw_x, y, node_type, label_encoder, node_type_encoder, timestamps = load_data(csv_path)
+    print("\nEVALUATION MODE:", split_mode)
+    print("Dataset:", csv_path or "selected interactively")
+    print("NOTE: Similarity graph uses all nodes (transductive setting).")
+    print("NOTE: Relations are telemetry-distance terciles, NOT protocol-defined edges.")
+    print("NOTE: Baselines use shared fixed training settings, not per-model grid search.")
+    print("NOTE: Chronological mode does not guarantee event independence or eliminate transductive edges.")
+    in_dim = raw_x.size(1)
+    out_dim = len(label_encoder.classes_)
+    num_node_types = len(node_type_encoder.classes_)
+    num_relations = 3
     per_seed_results = []
-
+    results = []
+    # Identical masks, preprocessing, and graph for every method within each seed.
+    datasets = {}
+    for seed in SEEDS:
+        set_seed(seed)
+        masks = (chronological_masks(timestamps, len(y)) if split_mode == "chronological"
+                 else create_masks(y, seed))
+        train_mask, val_mask, test_mask = masks
+        x = prepare_features(raw_x, train_mask)
+        edge_index, edge_type, _ = build_relation_graph(x)
+        data = Data(x=x, y=y, node_type=node_type, edge_index=edge_index,
+                    edge_type=edge_type, train_mask=train_mask, val_mask=val_mask,
+                    test_mask=test_mask).to(DEVICE)
+        datasets[seed] = data
+        if seed == SEEDS[0]:
+            print_class_distribution(y, label_encoder, masks)
     for model_name in MODEL_ORDER:
-        print("\n" + "=" * 95)
-        print(f"MODEL: {model_name}")
-        print("=" * 95)
-
-        micro_scores = []
-        macro_scores = []
-        precision_scores = []
-
-        for run, seed in enumerate(
-            SEEDS
-        ):
+        print("\n" + "="*95 + "\nMODEL:", model_name, "\n" + "="*95)
+        micro_scores, macro_scores, precision_scores = [], [], []
+        for run, seed in enumerate(SEEDS, start=1):
             set_seed(seed)
-
-            (
-                train_mask,
-                val_mask,
-                test_mask
-            ) = create_masks(
-                y,
-                seed
-            )
-
-            data = Data(
-                x=x,
-                y=y,
-                node_type=node_type,
-                edge_index=edge_index,
-                edge_type=edge_type,
-                train_mask=train_mask,
-                val_mask=val_mask,
-                test_mask=test_mask
-            ).to(DEVICE)
-
-            model = build_model(
-                model_name=model_name,
-                in_dim=in_dim,
-                hidden_dim=HIDDEN_DIM,
-                out_dim=out_dim,
-                num_node_types=num_node_types,
-                num_relations=num_relations
-            ).to(DEVICE)
-
-            (
-                micro,
-                macro,
-                precision
-            ) = train_model(
-                model,
-                model_name,
-                data
-            )
-
-            micro_scores.append(
-                micro
-            )
-
-            macro_scores.append(
-                macro
-            )
-
-            precision_scores.append(
-                precision
-            )
-
-            per_seed_results.append({
-                "Model": model_name,
-                "Run": run + 1,
-                "Seed": seed,
-                "Micro-F1": micro,
-                "Macro-F1": macro,
-                "Macro-Precision": precision
-            })
-
-            print(
-                f"Run {run + 1}/{RUNS} | "
-                f"Seed={seed} | "
-                f"Micro-F1={micro:.4f} | "
-                f"Macro-F1={macro:.4f} | "
-                f"Macro-Precision={precision:.4f}"
-            )
-
-        all_results.append({
-            "Model":
-                model_name,
-
-            "Micro-F1 Mean":
-                np.mean(
-                    micro_scores
-                ),
-
-            "Micro-F1 Std":
-                np.std(
-                    micro_scores,
-                    ddof=1
-                ),
-
-            "Macro-F1 Mean":
-                np.mean(
-                    macro_scores
-                ),
-
-            "Macro-F1 Std":
-                np.std(
-                    macro_scores,
-                    ddof=1
-                ),
-
-            "Macro-Precision Mean":
-                np.mean(
-                    precision_scores
-                ),
-
-            "Macro-Precision Std":
-                np.std(
-                    precision_scores,
-                    ddof=1
-                )
-        })
-
-    results_df = pd.DataFrame(
-        all_results
-    )
-
-    per_seed_df = pd.DataFrame(
-        per_seed_results
-    )
-
-    # Keep manuscript order.
-    results_df["Order"] = (
-        results_df["Model"]
-        .apply(MODEL_ORDER.index)
-    )
-
-    results_df = (
-        results_df
-        .sort_values("Order")
-        .drop(columns=["Order"])
-        .reset_index(drop=True)
-    )
-
-    # --------------------------------------------------------
-    # Save
-    # --------------------------------------------------------
-    results_df.to_csv(
-        "HGPNF_main_results.csv",
-        index=False
-    )
-
-    per_seed_df.to_csv(
-        "HGPNF_per_seed_results.csv",
-        index=False
-    )
-
-    # --------------------------------------------------------
-    # Print
-    # --------------------------------------------------------
-    print("\n" + "=" * 120)
-
-    print(
-        "FINAL RESULTS: MEAN ± STANDARD DEVIATION "
-        "OVER FIVE SHARED RANDOM SEEDS"
-    )
-
-    print("=" * 120)
-
-    print(
-        f"{'Model':<20} | "
-        f"{'Micro-F1':<27} | "
-        f"{'Macro-F1':<27} | "
-        f"{'Macro-Precision':<27}"
-    )
-
-    print("-" * 120)
-
+            data = datasets[seed]
+            model = build_model(model_name, in_dim, HIDDEN_DIM, out_dim,
+                                num_node_types, num_relations).to(DEVICE)
+            micro, macro, precision = train_model(model, model_name, data)
+            micro_scores.append(micro)
+            macro_scores.append(macro)
+            precision_scores.append(precision)
+            per_seed_results.append({"Model":model_name, "Seed":seed,
+                                     "Micro-F1":micro, "Macro-F1":macro,
+                                     "Macro-Precision":precision})
+            print(f"Run {run}/{RUNS} seed={seed}: Micro-F1={micro:.4f}, "
+                  f"Macro-F1={macro:.4f}, Macro-Precision={precision:.4f}")
+            if model_name == "HGPNF (Ours)" and seed == diagnostic_seed:
+                print_hgpnf_diagnostics(model, data, label_encoder, seed)
+        results.append({"Model":model_name,
+                        "Micro-F1 Mean":np.mean(micro_scores),
+                        "Micro-F1 Std":np.std(micro_scores, ddof=1),
+                        "Macro-F1 Mean":np.mean(macro_scores),
+                        "Macro-F1 Std":np.std(macro_scores, ddof=1),
+                        "Macro-Precision Mean":np.mean(precision_scores),
+                        "Macro-Precision Std":np.std(precision_scores, ddof=1)})
+    results_df = pd.DataFrame(results)
+    per_seed_df = pd.DataFrame(per_seed_results)
+    print("\nFINAL RESULTS — mean ± sample SD over 5 shared seeds")
     for _, row in results_df.iterrows():
-        print(
-            f"{row['Model']:<20} | "
-            f"{row['Micro-F1 Mean']:.4f} ± "
-            f"{row['Micro-F1 Std']:.4f} | "
-            f"{row['Macro-F1 Mean']:.4f} ± "
-            f"{row['Macro-F1 Std']:.4f} | "
-            f"{row['Macro-Precision Mean']:.4f} ± "
-            f"{row['Macro-Precision Std']:.4f}"
-        )
+        print(f"{row['Model']:<20} | Macro-F1 {row['Macro-F1 Mean']:.4f} ± {row['Macro-F1 Std']:.4f}"
+              f" | Micro-F1 {row['Micro-F1 Mean']:.4f} ± {row['Micro-F1 Std']:.4f}"
+              f" | Macro-P {row['Macro-Precision Mean']:.4f} ± {row['Macro-Precision Std']:.4f}")
+    print_latex_rows(results_df)
+    print("\nNo CSV, PDF or PNG files are created by this script.")
+    return results_df, per_seed_df
 
-    print("\nSaved:")
-    print("  HGPNF_main_results.csv")
-    print("  HGPNF_per_seed_results.csv")
-
-    print_latex_rows(
-        results_df
-    )
-
-    return (
-        results_df,
-        per_seed_df
-    )
-
-
-# ============================================================
-# 17. MAIN
-# ============================================================
 
 if __name__ == "__main__":
-    run_benchmark()
+    parser = argparse.ArgumentParser(description="HGPNF five-seed reviewer-revision benchmark")
+    parser.add_argument("--csv", default=None, help="Dataset CSV (omit for Tk file chooser)")
+    parser.add_argument("--split", choices=["random", "chronological"], default="random",
+                        help="Chronological mode requires complete timestamps")
+    parser.add_argument("--diagnostic-seed", type=int, default=42)
+    args = parser.parse_args()
+    run_benchmark(args.csv, args.split, args.diagnostic_seed)
